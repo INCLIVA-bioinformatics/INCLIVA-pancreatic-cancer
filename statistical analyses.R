@@ -235,3 +235,216 @@ explanatory_multi = c("ECOG", "INCLIVA_score")
 mar_test_pfs %>% 
   finalfit(dependent_pfs, explanatory, explanatory_multi) %>% 
   kable(row.names = F, caption= "PFS (Validation set). INCLIVA Score") # for vignette only
+
+
+
+####    Figure 1B       ######
+
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+
+colnames(PDAC_plasma_cancer_somatic)
+head(PDAC_plasma_cancer_somatic)
+table(DATA_CLINICA$Nº.WES)
+colnames(DATA_CLINICA)
+
+DATA_CLINICA$TIEMPO.DE.FUP..DÍAS. <- as.numeric(DATA_CLINICA$TIEMPO.DE.FUP..DÍAS.)
+DATA_CLINICA <- DATA_CLINICA %>% 
+  mutate(meses_fup = TIEMPO.DE.FUP..DÍAS. / 30)
+columnas_deseadas <- c( "Nº.WES", "meses_fup")
+nuevo_df <- DATA_CLINICA %>% 
+  select(all_of(columnas_deseadas)) %>%
+  filter_all(any_vars(. != ""))
+nuevo_df <- nuevo_df %>% 
+  mutate(fup_cat = ifelse(meses_fup > 11, "long", "short"))
+
+wes_somaticas <- PDAC_plasma_cancer_somatic
+wes_somaticas <- wes_somaticas %>%
+  filter(MAX_AF == "-" | (as.numeric(MAX_AF) <= 0.01)) %>%
+  filter(GENE_SYMBOL != "-")
+
+columnas_a_eliminar <- c(
+  "POSITION", "REF", "ALT", "GAF", "MAX_FREQ", "CONSEQUENCE", "IMPACT", 
+  "EXON", "HGVSp", "INCLIVA_PATH_MUTATION", "HOTSPOT", "MIXED_DB", 
+  "MIXED_ORIGIN", "MIXED_CLIN_SIG", "VARIANT_ID", "X1000G_AF", "MAX_AF", 
+  "GNOMAD", "CLINVAR", "SIFT", "POLYPHEN", "REVIEWED_VARIANT", 
+  "ONCOGENIC", "TREATMENT", "GENEINFO", "EVIDENCE_LEVEL", "PUBMED"
+)
+wes_somaticas <- wes_somaticas %>%
+  select(-one_of(columnas_a_eliminar))
+
+wes_somaticas <- wes_somaticas %>%
+  select(matches("GENE_SYMBOL|HGVSc|FREQUENCY"))
+
+replace_frequency_values <- function(column) {
+  ifelse(is.na(column), NA, ifelse(column == "-", FALSE, TRUE))
+}
+wes_somaticas <- wes_somaticas %>%
+  mutate_at(vars(contains("FREQUENCY")), list(~ replace_frequency_values(.)))
+
+wes_somaticas <- wes_somaticas %>%
+  mutate(HGVSc = sub("^[^:]+:", "", HGVSc))
+wes_somaticas <- wes_somaticas %>%
+  filter(!grepl("-", HGVSc, fixed = TRUE))
+
+
+rename_columns <- function(column_name) {
+  gsub("\\.", "-", gsub("^.*?\\.|_L1_FREQUENCY", "", column_name))
+}
+wes_somaticas <- wes_somaticas %>%
+  rename_with(~rename_columns(.), -c(GENE_SYMBOL, HGVSc))
+
+wes_somaticas_long <- wes_somaticas %>%
+  pivot_longer(cols = -c(GENE_SYMBOL, HGVSc), names_to = "paciente", values_to = "valor")
+
+merged_df <- left_join(wes_somaticas_long, nuevo_df, by = c("paciente" = "Nº.WES"))
+
+summary_df <- merged_df %>%
+  group_by(fup_cat, GENE_SYMBOL) %>%
+  summarise(TRUE_count = sum(valor == TRUE, na.rm = TRUE),
+            FALSE_count = sum(valor == FALSE, na.rm = TRUE))
+
+pivot_df <- summary_df %>%
+  pivot_wider(names_from = fup_cat, values_from = c("TRUE_count", "FALSE_count"), names_sep = "_")
+
+
+fisher_test_results <- apply(pivot_df[, c("TRUE_count_long", "FALSE_count_long", "TRUE_count_short", "FALSE_count_short")], 1, function(row) {
+  mat <- matrix(row, ncol = 2)
+  fisher.test(mat)
+})
+
+fisher_test_df <- data.frame(
+  GENE_SYMBOL = pivot_df$GENE_SYMBOL,
+  p_value = sapply(fisher_test_results, function(x) x$p.value),
+  odds_ratio = sapply(fisher_test_results, function(x) {
+    odds_ratio_short = x$estimate
+    return(odds_ratio_short)
+  })
+)
+
+
+fisher_test_df$p_value_adj <- p.adjust(fisher_test_df$p_value, method = "fdr")
+
+write.csv(fisher_test_df, file="mut_lower_than_11_months.csv")
+
+options(repr.plot.width=8, repr.plot.height=6)
+significance_level <- 0.05
+
+
+plot_object <- ggplot(fisher_test_df, aes(x = log2(odds_ratio), y = -log10(p_value), label = ifelse(abs(log2(odds_ratio)) > 3 & p_value < significance_level, as.character(GENE_SYMBOL), ""))) +
+  geom_point(aes(color = ifelse(p_value < significance_level, "red", "black")), alpha = 0.7) +
+  geom_text_repel(
+    box.padding = 0.5,
+    max.overlaps = Inf,  
+    force = 5,           
+    segment.size = 0.2,   
+    size = 3              
+  ) +
+  theme_minimal() +
+  labs(title = "Volcano Plot",
+       x = "log2(Odds Ratio)",
+       y = "-log10(p-value)",
+       color = "Significant") +
+  scale_color_manual(values = c("black", "red")) +
+  ylim(c(0, 10)) + 
+  theme(legend.position = "none")
+
+ggsave(file.path("~/Desktop", "volcano_plot_lower_11_moths.pdf"), plot_object, width = 8, height = 6)
+
+
+filtered_genes <- fisher_test_df$GENE_SYMBOL[abs(fisher_test_df$odds_ratio) > 1 & fisher_test_df$p_value_adj < significance_level]
+filtered_wes_somaticas <- wes_somaticas[wes_somaticas$GENE_SYMBOL %in% filtered_genes, ]
+logical_columns <- sapply(filtered_wes_somaticas, is.logical)
+filtered_wes_somaticas[, logical_columns] <- lapply(filtered_wes_somaticas[, logical_columns], as.numeric)
+filtered_wes_somaticas$gene <- paste(filtered_wes_somaticas$GENE_SYMBOL, filtered_wes_somaticas$HGVSc, sep = "_")
+filtered_wes_somaticas <- filtered_wes_somaticas[, !(names(filtered_wes_somaticas) %in% c("GENE_SYMBOL", "HGVSc"))]
+rownames(filtered_wes_somaticas) <- filtered_wes_somaticas$gene
+filtered_wes_somaticas$gene <- NULL 
+
+
+colors <- colorRampPalette(c("grey", "blue"))(2)
+
+plot_object <- pheatmap(
+  filtered_wes_somaticas,  
+  cluster_rows = FALSE,      
+  show_rownames = TRUE,        
+  col = colors,                   
+  main = "Heatmap de Genes Significativos"
+)
+
+ggsave(file.path("~/Desktop", "volcano_plot.pdf"), plot_object, width = 8, height = 6)
+
+
+#############################################################################
+############################liver vs not liver###############################
+#############################################################################
+
+
+####    Figure 1C       ######
+
+
+columnas_deseadas_2 <- c( "Nº.WES", "LOCALIZ.RECAÍDA.M1.AL.DIAG")
+nuevo_df_higado <- DATA_CLINICA %>% 
+  select(all_of(columnas_deseadas_2)) %>%
+  filter_all(any_vars(. != ""))
+
+nuevo_df_higado <- nuevo_df_higado %>%
+  mutate(met.liver = ifelse(grepl("HIGADO", LOCALIZ.RECAÍDA.M1.AL.DIAG, ignore.case = TRUE), "higado", "no higado"))
+
+merged_df_higado <- left_join(wes_somaticas_long, nuevo_df_higado, by = c("paciente" = "Nº.WES"))
+
+summary_df_higado <- merged_df_higado %>%
+  group_by(met.liver, GENE_SYMBOL) %>%
+  summarise(TRUE_count = sum(valor == TRUE, na.rm = TRUE),
+            FALSE_count = sum(valor == FALSE, na.rm = TRUE))
+
+pivot_df_higado <- summary_df_higado %>%
+  pivot_wider(names_from = met.liver, values_from = c("TRUE_count", "FALSE_count"), names_sep = "_")
+colnames(pivot_df_higado)
+
+fisher_test_results_higado <- apply(pivot_df_higado[, c("TRUE_count_higado", "FALSE_count_higado", "TRUE_count_no higado", "FALSE_count_no higado")], 1, function(row) {
+  mat <- matrix(row, ncol = 2)
+  fisher.test(mat)
+})
+
+fisher_test_results_higado <- data.frame(
+  GENE_SYMBOL = pivot_df_higado$GENE_SYMBOL,
+  p_value = sapply(fisher_test_results_higado, function(x) x$p.value),
+  odds_ratio = sapply(fisher_test_results_higado, function(x) {
+    odds_ratio_higado = x$estimate
+    return(odds_ratio_higado)
+  })
+)
+
+
+fisher_test_results_higado$p_value_adj <- p.adjust(fisher_test_results_higado$p_value, method = "fdr")
+
+write.csv(fisher_test_results_higado, file="mut_patients_higado.csv")
+
+options(repr.plot.width=8, repr.plot.height=6)
+significance_level <- 0.01
+
+
+plot_object <- ggplot(fisher_test_results_higado, aes(x = log2(odds_ratio), y = -log10(p_value), label = ifelse(abs(log2(odds_ratio)) > 3 & p_value < significance_level, as.character(GENE_SYMBOL), ""))) +
+  geom_point(aes(color = ifelse(p_value < significance_level, "red", "black")), alpha = 0.7) +
+  geom_text_repel(
+    box.padding = 0.5,
+    max.overlaps = Inf,  
+    force = 5,           
+    segment.size = 0.2,   
+    size = 3              
+  ) +
+  theme_minimal() +
+  labs(title = "Volcano Plot",
+       x = "log2(Odds Ratio)",
+       y = "-log10(p-value)",
+       color = "Significant") +
+  scale_color_manual(values = c("black", "red")) +
+  ylim(c(0, 10)) + 
+  theme(legend.position = "none")
+
+ggsave(file.path("~/Desktop", "volcano_plot_higado.pdf"), plot_object, width = 8, height = 6)
